@@ -4,9 +4,9 @@ import os
 import smtplib
 import ssl
 from email.message import EmailMessage
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+
+from flask import Flask, jsonify, request
 
 
 def load_subscribers(path: Path) -> list:
@@ -48,76 +48,55 @@ def send_welcome_email(
         server.send_message(msg)
 
 
-class SubscribeHandler(BaseHTTPRequestHandler):
-    server_version = "ZeroVirusSubscribe/1.0"
+app = Flask("ZeroVirusSubscribe")
+STORE_PATH: Path = Path("subscribers.json")
+TOKEN_REQUIRED = ""
+SMTP_CONFIG = None
 
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path != "/subscribe":
-            self.send_error(404, "Not Found")
-            return
 
-        token_required = getattr(self.server, "token", "")
-        if token_required:
-            token = self.headers.get("X-Auth-Token", "")
-            if not token:
-                qs = parse_qs(parsed.query or "")
-                token = (qs.get("token") or [""])[0]
-            if token != token_required:
-                self.send_error(403, "Forbidden")
-                return
+@app.post("/subscribe")
+def subscribe() -> tuple:
+    token_required = TOKEN_REQUIRED
+    if token_required:
+        token = request.headers.get("X-Auth-Token", "")
+        if not token:
+            token = request.args.get("token", "")
+        if token != token_required:
+            return jsonify({"status": "error", "error": "forbidden"}), 403
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length else b""
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    if "@" not in email or "." not in email:
+        return jsonify({"status": "error", "error": "invalid email"}), 400
+
+    emails = load_subscribers(STORE_PATH)
+    if email not in emails:
+        emails.append(email)
+        save_subscribers(STORE_PATH, emails)
+
+    welcome_sent = False
+    smtp_config = SMTP_CONFIG
+    if smtp_config:
         try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
-            return
+            send_welcome_email(
+                smtp_host=smtp_config["host"],
+                smtp_port=smtp_config["port"],
+                smtp_user=smtp_config["user"],
+                smtp_pass=smtp_config["pass"],
+                sender=smtp_config["from"],
+                recipient=email,
+                subject=smtp_config["subject"],
+                body=smtp_config["body"],
+            )
+            welcome_sent = True
+        except Exception:
+            welcome_sent = False
 
-        email = str(payload.get("email", "")).strip()
-        if "@" not in email or "." not in email:
-            self.send_error(400, "Invalid email")
-            return
-
-        store: Path = getattr(self.server, "store")
-        emails = load_subscribers(store)
-        if email not in emails:
-            emails.append(email)
-            save_subscribers(store, emails)
-
-        welcome_sent = False
-        smtp_config = getattr(self.server, "smtp_config", None)
-        if smtp_config:
-            try:
-                send_welcome_email(
-                    smtp_host=smtp_config["host"],
-                    smtp_port=smtp_config["port"],
-                    smtp_user=smtp_config["user"],
-                    smtp_pass=smtp_config["pass"],
-                    sender=smtp_config["from"],
-                    recipient=email,
-                    subject=smtp_config["subject"],
-                    body=smtp_config["body"],
-                )
-                welcome_sent = True
-            except Exception:
-                welcome_sent = False
-
-        response = json.dumps(
-            {"status": "ok", "email": email, "welcome_sent": welcome_sent}
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-
-    def log_message(self, format: str, *args) -> None:
-        return
+    return jsonify({"status": "ok", "email": email, "welcome_sent": welcome_sent}), 200
 
 
 def main() -> None:
+    global STORE_PATH, TOKEN_REQUIRED, SMTP_CONFIG
     parser = argparse.ArgumentParser(description="ZeroVirus subscriber server")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument("--port", type=int, default=8787, help="Bind port")
@@ -177,11 +156,10 @@ def main() -> None:
     store = Path(args.store).resolve()
     store.parent.mkdir(parents=True, exist_ok=True)
 
-    server = HTTPServer((args.host, args.port), SubscribeHandler)
-    server.store = store
-    server.token = args.token
+    STORE_PATH = store
+    TOKEN_REQUIRED = args.token
     if args.smtp_host and args.smtp_user and args.smtp_pass and args.from_email:
-        server.smtp_config = {
+        SMTP_CONFIG = {
             "host": args.smtp_host,
             "port": args.smtp_port,
             "user": args.smtp_user,
@@ -192,11 +170,11 @@ def main() -> None:
         }
         print("SMTP welcome email enabled.")
     else:
-        server.smtp_config = None
+        SMTP_CONFIG = None
     print(f"Subscriber server listening on http://{args.host}:{args.port}/subscribe")
     if args.token:
         print("Token auth enabled.")
-    server.serve_forever()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8787)))
 
 
 if __name__ == "__main__":
